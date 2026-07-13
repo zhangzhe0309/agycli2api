@@ -11,7 +11,7 @@ This project is AI-Agent friendly. This document contains guidelines and informa
 The source code is written in TypeScript and resides in the `src` directory:
 
 - **`src/index.ts`**: The entry point. It configures the Express server, sets up the optional API key authentication middleware, and defines the main routing logic to the proxy handler.
-- **`src/proxy.ts`**: The core proxying logic. It manages session correlation (via content hashing), constructs proper payloads with labels and identifiers matching the official Antigravity plugin, handles the upstream requests to Cloud Code endpoints, and passes back responses (including SSE streams).
+- **`src/proxy.ts`**: The core proxying logic. It retrieves and maps the account's available models for the Gemini-compatible model listing endpoint, manages session correlation (via content hashing), constructs proper payloads with labels and identifiers matching the official Antigravity plugin, handles the upstream requests to Cloud Code endpoints, and passes back responses (including SSE streams).
 - **`src/auth.ts`**: Handles authentication and token lifecycle. It reads the local OAuth token (`~/.gemini/antigravity-cli/antigravity-oauth-token`), checks for expiration, and automatically refreshes the token when necessary.
 - **`src/config.ts`**: Contains static configuration, environment variable fallback definitions, endpoints, and the simulated Antigravity `User-Agent` generator.
 

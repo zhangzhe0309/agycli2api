@@ -37,6 +37,13 @@ interface Session {
 
 interface ModelConfig {
 	model?: string;
+	version?: string;
+	displayName?: string;
+	description?: string;
+	inputTokenLimit?: number;
+	maxInputTokens?: number;
+	contextWindow?: number;
+	contextWindowSize?: number;
 	maxOutputTokens?: number;
 	supportsThinking?: boolean;
 	thinkingBudget?: number;
@@ -296,6 +303,115 @@ async function fetchModels(token: string, project: string) {
 		);
 	}
 	return cachedModels?.models || {};
+}
+
+interface GeminiModel {
+	name: string;
+	baseModelId: string;
+	version: string;
+	displayName: string;
+	description?: string;
+	inputTokenLimit?: number;
+	outputTokenLimit?: number;
+	supportedGenerationMethods: string[];
+	thinking?: boolean;
+}
+
+function toGeminiModel(modelId: string, config: ModelConfig): GeminiModel {
+	const inputTokenLimit =
+		config.inputTokenLimit ??
+		config.maxInputTokens ??
+		config.contextWindow ??
+		config.contextWindowSize;
+	const model: GeminiModel = {
+		name: `models/${modelId}`,
+		baseModelId: modelId,
+		version: config.version || modelId,
+		displayName: config.displayName || modelId,
+		supportedGenerationMethods: ["generateContent", "streamGenerateContent"],
+	};
+
+	if (config.description) model.description = config.description;
+	if (typeof inputTokenLimit === "number") {
+		model.inputTokenLimit = inputTokenLimit;
+	}
+	if (typeof config.maxOutputTokens === "number") {
+		model.outputTokenLimit = config.maxOutputTokens;
+	}
+	if (typeof config.supportsThinking === "boolean") {
+		model.thinking = config.supportsThinking;
+	}
+
+	return model;
+}
+
+function parsePageSize(value: unknown): number {
+	if (value === undefined) return 50;
+	if (typeof value !== "string" || !/^\d+$/.test(value)) {
+		throw new Error("pageSize must be a non-negative integer.");
+	}
+
+	const pageSize = Number(value);
+	return pageSize === 0 ? 50 : Math.min(pageSize, 1000);
+}
+
+function parsePageToken(value: unknown, pageSize: number): number {
+	if (value === undefined) return 0;
+	if (typeof value !== "string") throw new Error("Invalid pageToken.");
+
+	try {
+		const token = JSON.parse(
+			Buffer.from(value, "base64url").toString("utf8"),
+		) as { offset?: unknown; pageSize?: unknown };
+		if (
+			!Number.isSafeInteger(token.offset) ||
+			(token.offset as number) < 0 ||
+			token.pageSize !== pageSize
+		) {
+			throw new Error();
+		}
+		return token.offset as number;
+	} catch {
+		throw new Error("Invalid pageToken.");
+	}
+}
+
+function createPageToken(offset: number, pageSize: number): string {
+	return Buffer.from(JSON.stringify({ offset, pageSize })).toString(
+		"base64url",
+	);
+}
+
+export async function handleListModels(req: Request, res: Response) {
+	try {
+		const pageSize = parsePageSize(req.query.pageSize);
+		const offset = parsePageToken(req.query.pageToken, pageSize);
+		const token = await getToken();
+		const projectName = await fetchProject(token);
+		const availableModels = await fetchModels(token, projectName);
+		const allModels = Object.entries(availableModels)
+			.map(([modelId, config]) => toGeminiModel(modelId, config as ModelConfig))
+			.sort((left, right) => left.name.localeCompare(right.name));
+		const models = allModels.slice(offset, offset + pageSize);
+		const nextOffset = offset + models.length;
+
+		res.json({
+			models,
+			...(nextOffset < allModels.length && {
+				nextPageToken: createPageToken(nextOffset, pageSize),
+			}),
+		});
+	} catch (err) {
+		const message = (err as Error).message;
+		if (message === "Invalid pageToken." || message.startsWith("pageSize ")) {
+			return res.status(400).json({
+				error: { code: 400, message, status: "INVALID_ARGUMENT" },
+			});
+		}
+
+		console.error("Error listing models:", err);
+		return res.status(500).json({ error: { message } });
+	}
 }
 
 // --- Extracted helpers for handleGenerateContent ---

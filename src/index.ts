@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import cors from "cors";
 import express from "express";
-import { handleGenerateContent } from "./proxy.js";
+import { handleGenerateContent, handleListModels } from "./proxy.js";
 
 const app = express();
 app.use(cors());
@@ -35,6 +35,8 @@ app.use((req, res, next) => {
 });
 
 // Standard Gemini endpoints proxy mapped to Cloud Code
+app.get("/v1beta/models", handleListModels);
+
 app.post("/v1beta/models/:modelAndAction", (req, res) => {
 	const [model, action] = req.params.modelAndAction.split(":");
 	const isStreaming = action === "streamGenerateContent";

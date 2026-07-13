@@ -4,7 +4,7 @@ A lightweight, single-user API proxy for Antigravity, exposing a standard Gemini
 
 ## Features
 
-- **Standard Gemini API**: Clients can just send Gemini standard requests to `/v1beta/models/:model:generateContent`.
+- **Standard Gemini API**: Clients can list available models with `GET /v1beta/models` and generate content with `POST /v1beta/models/:model:generateContent`.
 - **Streaming Support**: Full Server-Sent Events (SSE) pass-through.
 - **Anti-Ban Workarounds**: Automatically rewrites User-Agent, Client versions, and headers to match the official [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli).
 - **Seamless Authentication**: Directly reads and automatically refreshes tokens managed by Antigravity CLI.
@@ -42,7 +42,15 @@ npm run dev
 
 The server will run on port `3403` by default.
 
-### Example Request
+### Example Requests
+
+List the models available to the authenticated Antigravity account:
+
+```bash
+curl "http://localhost:3403/v1beta/models?key=YOUR_API_KEY"
+```
+
+Generate content:
 
 ```bash
 curl -X POST http://localhost:3403/v1beta/models/gemini-3-flash:generateContent \
