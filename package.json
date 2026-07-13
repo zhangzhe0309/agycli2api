@@ -6,8 +6,8 @@
 	"type": "module",
 	"scripts": {
 		"build": "tsc",
-		"start": "node --use-env-proxy dist/index.js",
-		"dev": "nodemon --exec \"tsx --use-env-proxy\" src/index.ts",
+		"start": "node --use-env-proxy --use-system-ca dist/index.js",
+		"dev": "nodemon --exec \"tsx --use-env-proxy --use-system-ca\" src/index.ts",
 		"lint": "biome lint .",
 		"format": "biome format --write .",
 		"check": "biome check --write .",
