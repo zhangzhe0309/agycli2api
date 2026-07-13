@@ -50,6 +50,20 @@ List the models available to the authenticated Antigravity account:
 curl "http://localhost:3403/v1beta/models?key=YOUR_API_KEY"
 ```
 
+For a formatted, readable table, use the included script:
+
+```bash
+AGYCLI2API_URL=http://localhost:3403 \
+AGYCLI2API_KEY=YOUR_API_KEY \
+npm run list-models
+```
+
+The URL defaults to `http://localhost:3403`. You can also pass options directly:
+
+```bash
+npm run list-models -- --url http://agycli2api:3403 --key YOUR_API_KEY
+```
+
 Generate content:
 
 ```bash
