@@ -166,42 +166,80 @@ interface CachedProject {
 
 let cachedProject: CachedProject | null = null;
 
+function formatRequestError(error: unknown): string {
+	if (!(error instanceof Error)) {
+		return String(error);
+	}
+
+	const details = [`${error.name}: ${error.message}`];
+	const networkError = error as Error & {
+		code?: string;
+		errno?: string | number;
+		syscall?: string;
+		hostname?: string;
+		address?: string;
+		port?: number;
+	};
+	const context = [
+		networkError.code && `code=${networkError.code}`,
+		networkError.errno !== undefined && `errno=${networkError.errno}`,
+		networkError.syscall && `syscall=${networkError.syscall}`,
+		networkError.hostname && `hostname=${networkError.hostname}`,
+		networkError.address && `address=${networkError.address}`,
+		networkError.port !== undefined && `port=${networkError.port}`,
+	].filter(Boolean);
+
+	if (context.length > 0) {
+		details.push(`[${context.join(", ")}]`);
+	}
+	if (error.cause !== undefined && error.cause !== error) {
+		details.push(`cause: ${formatRequestError(error.cause)}`);
+	}
+	return details.join(" ");
+}
+
 async function fetchProject(token: string | null) {
 	if (!token) throw new Error("Token is required to fetch project.");
 	if (cachedProject && cachedProject.token === token)
 		return cachedProject.project;
+
+	const endpoint = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:loadCodeAssist`;
+	let failureReason: string | null = null;
 	try {
-		const response = await fetch(
-			`${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:loadCodeAssist`,
-			{
-				method: "POST",
-				headers: {
-					...ANTIGRAVITY_HEADERS,
-					Authorization: `Bearer ${token}`,
-				},
-				body: JSON.stringify({
-					metadata: {
-						ideType: "ANTIGRAVITY",
-					},
-				}),
+		const response = await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				...ANTIGRAVITY_HEADERS,
+				Authorization: `Bearer ${token}`,
 			},
-		);
+			body: JSON.stringify({
+				metadata: {
+					ideType: "ANTIGRAVITY",
+				},
+			}),
+		});
 		if (response.ok) {
 			const data = await response.json();
 			if (data?.cloudaicompanionProject) {
 				cachedProject = { token, project: data.cloudaicompanionProject };
 			}
 		} else {
+			failureReason = `HTTP ${response.status}: ${await response.text()}`;
 			console.warn(
-				`Failed to fetch project info: ${response.status} - ${await response.text()}`,
+				`Failed to fetch project info from ${endpoint}: ${failureReason}`,
 			);
 		}
 	} catch (err) {
-		console.warn("Error fetching project info:", (err as Error).message);
+		failureReason = formatRequestError(err);
+		console.warn(
+			`Error fetching project info from ${endpoint}: ${failureReason}`,
+		);
 	}
 	if (!cachedProject || cachedProject.token !== token) {
 		throw new Error(
-			"Failed to fetch Google Cloud Code project. Make sure you are authenticated via antigravity-cli.",
+			failureReason
+				? `Failed to fetch Google Cloud Code project: ${failureReason}`
+				: "Failed to fetch Google Cloud Code project: upstream response did not contain a project.",
 		);
 	}
 	return cachedProject.project;
@@ -226,18 +264,16 @@ async function fetchModels(token: string, project: string) {
 	if (isCacheValid && cachedModels) {
 		return cachedModels.models;
 	}
+	const endpoint = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:fetchAvailableModels`;
 	try {
-		const response = await fetch(
-			`${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:fetchAvailableModels`,
-			{
-				method: "POST",
-				headers: {
-					...ANTIGRAVITY_HEADERS,
-					Authorization: `Bearer ${token}`,
-				},
-				body: JSON.stringify({ project }),
+		const response = await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				...ANTIGRAVITY_HEADERS,
+				Authorization: `Bearer ${token}`,
 			},
-		);
+			body: JSON.stringify({ project }),
+		});
 		if (response.ok) {
 			const data = await response.json();
 			if (data?.models) {
@@ -251,11 +287,13 @@ async function fetchModels(token: string, project: string) {
 			}
 		} else {
 			console.warn(
-				`Failed to fetch models: ${response.status} - ${await response.text()}`,
+				`Failed to fetch models from ${endpoint}: HTTP ${response.status}: ${await response.text()}`,
 			);
 		}
 	} catch (err) {
-		console.warn("Error fetching models:", (err as Error).message);
+		console.warn(
+			`Error fetching models from ${endpoint}: ${formatRequestError(err)}`,
+		);
 	}
 	return cachedModels?.models || {};
 }
