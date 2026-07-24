@@ -158,3 +158,10 @@ curl -X POST http://localhost:3403/chat/completions \
 ## 📄 开源协议
 
 基于 [MIT License](LICENSE) 开源。
+
+---
+
+## 🙏 致谢 / Credits
+
+本项目基于开源项目 [Arocial/agycli2api](https://github.com/Arocial/agycli2api) 进行二次开发与功能扩展。感谢原作者及开源社区的贡献！
+
