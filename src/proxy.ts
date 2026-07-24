@@ -35,7 +35,7 @@ interface Session {
 	lastExecutionId: string | null;
 }
 
-interface ModelConfig {
+export interface ModelConfig {
 	model?: string;
 	version?: string;
 	displayName?: string;
@@ -205,7 +205,7 @@ function formatRequestError(error: unknown): string {
 	return details.join(" ");
 }
 
-async function fetchProject(token: string | null) {
+export async function fetchProject(token: string | null) {
 	if (!token) throw new Error("Token is required to fetch project.");
 	if (cachedProject && cachedProject.token === token)
 		return cachedProject.project;
@@ -261,7 +261,7 @@ interface CachedModels {
 
 let cachedModels: CachedModels | null = null;
 
-async function fetchModels(token: string, project: string) {
+export async function fetchModels(token: string, project: string) {
 	const isCacheValid =
 		cachedModels &&
 		cachedModels.token === token &&
@@ -521,7 +521,7 @@ function buildSystemInstruction(
  * Build the full upstream payload including session metadata, labels, and
  * telemetry fields.
  */
-function buildPayload(
+export function buildPayload(
 	// biome-ignore lint/suspicious/noExplicitAny: express request body is untyped
 	originalBody: any,
 	session: Session,
