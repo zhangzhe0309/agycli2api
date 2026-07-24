@@ -8,9 +8,9 @@
 
 - **双接口兼容**：
   - **Gemini 原生接口**：支持 `GET /v1beta/models` 查询模型列表及 `POST /v1beta/models/:model:generateContent` 生成内容。
-  - **OpenAI 兼容接口**：原生提供 `POST /chat/completions` 路由，方便支持 OpenAI 格式的客户端（如 Hermes、LangChain、Claude Code 等）无缝无缝接入。
-- **完整 Tool / Function Calling 支持**：自动完成 OpenAI Tools ���式与 Gemini `functionDeclarations` 之间的双向映射。
-- **流式传输 (SSE)**：全量支持 Server-Sent Events (SSE) 流式响应Pass-through。
+  - **OpenAI 兼容接口**：原生提供 `POST /chat/completions` 路由，方便支持 OpenAI 格式的客户端（如 Hermes、LangChain、Claude Code 等）无缝接入。
+- **完整 Tool / Function Calling 支持**：自动完成 OpenAI Tools 格式与 Gemini `functionDeclarations` 之间的双向映射。
+- **流式传输 (SSE)**：全量支持 Server-Sent Events (SSE) 流式响应 Pass-through。
 - **思维链 (Thinking Budget) 优化**：自动调优 `maxOutputTokens`，避免由于思考过程消耗 Token 导致输出截断。
 - **防封与遥测伪装**：自动重写 `User-Agent`、客户端版本号与 Headers，完全一致化匹配官方 [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)。
 - **无缝 OAuth 鉴权**：直接读取并自动刷新 Antigravity CLI 生成与管理的 OAuth 凭据。
