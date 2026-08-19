@@ -16,16 +16,36 @@ v3: Full tool/function-calling support:
     as "Empty response" -> retry/fallback).
 v3.1: Force maxOutputTokens=65535 — gemini-3.6 thinking budget INCLUDES thought
     tokens; mapping Hermes max_tokens directly starves visible output.
+v4: Transport layer rewrite:
+    - ThreadingHTTPServer: a streaming request no longer blocks all others.
+    - Native http.client instead of curl subprocesses: no per-request fork,
+      no stdin pipe deadlock on large bodies, socket timeout on every read.
+    - Catch BrokenPipeError/ConnectionResetError: client disconnects during
+      SSE no longer dump tracebacks (was flooding journald).
+    - _forward now passes through the upstream status code (was always 200).
+    - BRIDGE_DEBUG env gates diagnostic logging (was always on).
+    - BRIDGE_PROXY_URL / BRIDGE_API_KEY / BRIDGE_UPSTREAM_TIMEOUT env config.
+    - Malformed JSON bodies get a clean 400 instead of a crashed handler.
 """
+import http.client
 import json
+import os
 import sys
-import subprocess
 import time
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
-PROXY_URL = "http://127.0.0.1:3403"
-API_KEY = "hermes-agy-proxy-2026"
+PROXY_URL = os.environ.get("BRIDGE_PROXY_URL", "http://127.0.0.1:3403")
+API_KEY = os.environ.get("BRIDGE_API_KEY", "hermes-agy-proxy-2026")
+DEBUG = os.environ.get("BRIDGE_DEBUG", "").lower() in ("1", "true", "yes")
+# Socket-level timeout per upstream read; for SSE this bounds the gap between
+# events (long thinking pauses included), not the total request duration.
+UPSTREAM_TIMEOUT = float(os.environ.get("BRIDGE_UPSTREAM_TIMEOUT", "300"))
+
+_parsed_proxy = urlparse(PROXY_URL)
+PROXY_HOST = _parsed_proxy.hostname or "127.0.0.1"
+PROXY_PORT = _parsed_proxy.port or 80
 
 # Map short model names to full model names supported by agycli2api/Antigravity.
 _MODEL_MAP = {
@@ -54,6 +74,22 @@ def _resolve_model(name: str, reasoning_effort: str = None) -> str:
 # JSON-schema keys Gemini's functionDeclarations accepts.
 _SCHEMA_KEYS = ("type", "properties", "required", "items", "enum", "description",
                 "format", "anyOf", "allOf", "minimum", "maximum", "default")
+
+
+def _upstream_request(method, path, body=None, timeout=UPSTREAM_TIMEOUT):
+    """Open an http.client connection to the local proxy and send a request.
+
+    Returns (conn, response); the caller owns both and must conn.close().
+    Raises OSError subclasses on connection/socket failures.
+    """
+    conn = http.client.HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=timeout)
+    try:
+        conn.request(method, path, body=body,
+                     headers={"Content-Type": "application/json"})
+        return conn, conn.getresponse()
+    except Exception:
+        conn.close()
+        raise
 
 
 def _extract_text(candidates):
@@ -311,7 +347,12 @@ def _parse_gemini_sse_line(line):
 
 
 def _dbg(msg):
-    """Diagnostic to stderr (visible via: journalctl -u hermes-gemini-bridge)."""
+    """Diagnostic to stderr (visible via: journalctl -u hermes-gemini-bridge).
+
+    Gated by BRIDGE_DEBUG=1 to keep journald quiet in production.
+    """
+    if not DEBUG:
+        return
     try:
         sys.stderr.write(f"[BRIDGE_DBG] {msg}\n")
         sys.stderr.flush()
@@ -321,8 +362,23 @@ def _dbg(msg):
 
 class BridgeHandler(BaseHTTPRequestHandler):
 
+    def _send_json(self, status, payload):
+        """Send a JSON (or raw passthrough) response with Content-Length."""
+        raw = payload if isinstance(payload, (bytes, bytearray)) else \
+            json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _client_gone(self, err):
+        """True when the error means the client disconnected mid-stream."""
+        return isinstance(err, (BrokenPipeError, ConnectionResetError,
+                                ConnectionAbortedError))
+
     def do_GET(self):
-        self._forward(PROXY_URL + self.path, "GET")
+        self._forward(self.path, "GET")
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -331,11 +387,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         parsed_path = self.path.split("?")[0]
         # Pass through native Gemini paths directly.
         if parsed_path.startswith("/v1beta/models") or "/generateContent" in self.path:
-            self._forward(PROXY_URL + self.path, "POST", body)
+            self._forward(self.path, "POST", body)
             return
 
         if parsed_path in ("/chat/completions", "/v1/chat/completions"):
-            data = json.loads(body) if body else {}
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError as e:
+                self._send_json(400, {"error": f"invalid JSON body: {e}"})
+                return
             model = data.get("model", "gemini-3.6-flash-medium")
             is_stream = data.get("stream", False)
 
@@ -365,26 +425,37 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else:
                 self._handle_non_streaming(model, req_data, effort=effort)
         else:
-            self._forward(PROXY_URL + self.path, "POST", body)
+            self._forward(self.path, "POST", body)
 
     def _handle_non_streaming(self, model, req_data, effort=None):
         """Non-streaming: call :generateContent, return full OpenAI JSON."""
         resolved = _resolve_model(model, effort)
-        target = f"{PROXY_URL}/v1beta/models/{resolved}:generateContent?key={API_KEY}"
-        proc = subprocess.run(
-            ["curl", "-s", "-X", "POST", target,
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-"],
-            input=req_data, capture_output=True, timeout=120,
-        )
+        path = f"/v1beta/models/{resolved}:generateContent?key={API_KEY}"
         try:
-            resp_data = json.loads(proc.stdout) if proc.stdout else {}
+            conn, resp = _upstream_request("POST", path, body=req_data)
+        except OSError as e:
+            self._send_json(502, {"error": f"upstream connection failed: {e}"})
+            return
+
+        try:
+            raw = resp.read()
+            status = resp.status
+        except OSError as e:
+            self._send_json(502, {"error": f"upstream read failed: {e}"})
+            return
+        finally:
+            conn.close()
+
+        try:
+            resp_data = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "upstream returned non-JSON",
-                                         "raw": proc.stdout[:500].decode("utf-8", "replace")}).encode())
+            self._send_json(502, {"error": "upstream returned non-JSON",
+                                  "raw": raw[:500].decode("utf-8", "replace")})
+            return
+
+        if status != 200:
+            # Pass the upstream error through with its real status code.
+            self._send_json(status, resp_data if isinstance(resp_data, dict) else raw)
             return
 
         if "candidates" in resp_data:
@@ -425,31 +496,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "total_tokens": usage.get("totalTokenCount", 0),
                 },
             }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(openai_resp, ensure_ascii=False).encode())
+            self._send_json(200, openai_resp)
         else:
             status_code = resp_data.get("error", {}).get("code", 500) or 500
-            self.send_response(status_code if isinstance(status_code, int) else 500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(proc.stdout)
+            self._send_json(status_code if isinstance(status_code, int) else 500, resp_data)
 
     def _handle_streaming(self, model, req_data, effort=None):
         """Streaming: call :streamGenerateContent, translate SSE events."""
         resolved = _resolve_model(model, effort)
-        target = f"{PROXY_URL}/v1beta/models/{resolved}:streamGenerateContent?key={API_KEY}&alt=sse"
-        proc = subprocess.Popen(
-            ["curl", "-s", "-N", "-X", "POST", target,
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        proc.stdin.write(req_data)
-        proc.stdin.close()
+        path = f"/v1beta/models/{resolved}:streamGenerateContent?key={API_KEY}&alt=sse"
+        try:
+            conn, resp = _upstream_request("POST", path, body=req_data)
+        except OSError as e:
+            self._send_json(502, {"error": f"upstream connection failed: {e}"})
+            return
+
+        if resp.status != 200:
+            raw = resp.read()
+            conn.close()
+            ct = resp.getheader("Content-Type", "application/json")
+            self.send_response(resp.status)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -462,93 +533,123 @@ class BridgeHandler(BaseHTTPRequestHandler):
         saw_tool_call = False
         _ev_log = []
 
-        for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace")
-            gemini_event = _parse_gemini_sse_line(line)
-            if gemini_event is None:
-                continue
-            candidates = gemini_event.get("candidates", [])
-            if not candidates:
-                continue
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            _ev_log.append(f"{candidates[0].get('finishReason') or '-'}/"
-                           f"{'+'.join(sorted(set(k for p in parts for k in p.keys())))}")
-            for part in parts:
-                # Function call -> OpenAI tool_calls delta
-                if "functionCall" in part:
-                    tc = _tool_call_from_function_call(part, 0)
-                    if tc:
-                        chunk = _build_openai_chunk(model, tool_calls=[tc])
-                        self.wfile.write(chunk.encode())
-                        self.wfile.flush()
-                        saw_tool_call = True
-                    continue
-                # Visible text delta (skip pure-thought chunks)
-                if "text" in part and not part.get("thought"):
-                    delta = part["text"]
-                    if not delta:
-                        continue
-                    # Gemini sends cumulative text; emit only the new suffix.
-                    if delta.startswith(acc_text):
-                        new_text = delta[len(acc_text):]
-                        if new_text:
-                            self.wfile.write(_build_openai_chunk(model, new_text).encode())
-                            self.wfile.flush()
-                        acc_text = delta
-                    else:
-                        self.wfile.write(_build_openai_chunk(model, delta).encode())
-                        self.wfile.flush()
-                        acc_text = delta
-
-            fr = candidates[0].get("finishReason")
-            if fr and fr != "FINISH_REASON_UNSPECIFIED":
-                _finish_map = {
-                    "STOP": "tool_calls" if saw_tool_call else "stop",
-                    "MAX_TOKENS": "length",
-                    "SAFETY": "content_filter",
-                    "RECITATION": "content_filter",
-                    "MALFORMED_FUNCTION_CALL": "stop",  # let caller retry; emit as stop
-                }
-                finish_reason = _finish_map.get(fr, "stop")
-
-        _dbg(f"stream done finish={finish_reason} text_len={len(acc_text)} tool_call={saw_tool_call} events={_ev_log}")
-
-        # Final chunk carries the finish_reason.
-        self.wfile.write(_build_openai_chunk(model, "", finish_reason=finish_reason).encode())
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-
-        proc.wait()
-        self.close_connection = True
-
-    def _forward(self, url, method, body=None):
-        cmd = ["curl", "-s", "-X", method, url, "-H", "Content-Type: application/json"]
-        auth_header = self.headers.get("Authorization")
-        if auth_header:
-            cmd += ["-H", f"Authorization: {auth_header}"]
         try:
-            if body:
-                proc = subprocess.run(cmd, input=body, capture_output=True, timeout=120)
-            else:
-                proc = subprocess.run(cmd, capture_output=True, timeout=120)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(proc.stdout)
-        except Exception as e:
-            self.send_response(502)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace")
+                gemini_event = _parse_gemini_sse_line(line)
+                if gemini_event is None:
+                    continue
+                candidates = gemini_event.get("candidates", [])
+                if not candidates:
+                    continue
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                _ev_log.append(f"{candidates[0].get('finishReason') or '-'}/"
+                               f"{'+'.join(sorted(set(k for p in parts for k in p.keys())))}")
+                for part in parts:
+                    # Function call -> OpenAI tool_calls delta
+                    if "functionCall" in part:
+                        tc = _tool_call_from_function_call(part, 0)
+                        if tc:
+                            chunk = _build_openai_chunk(model, tool_calls=[tc])
+                            self.wfile.write(chunk.encode())
+                            self.wfile.flush()
+                            saw_tool_call = True
+                        continue
+                    # Visible text delta (skip pure-thought chunks)
+                    if "text" in part and not part.get("thought"):
+                        delta = part["text"]
+                        if not delta:
+                            continue
+                        # Gemini sends cumulative text; emit only the new suffix.
+                        if delta.startswith(acc_text):
+                            new_text = delta[len(acc_text):]
+                            if new_text:
+                                self.wfile.write(_build_openai_chunk(model, new_text).encode())
+                                self.wfile.flush()
+                            acc_text = delta
+                        else:
+                            self.wfile.write(_build_openai_chunk(model, delta).encode())
+                            self.wfile.flush()
+                            acc_text = delta
+
+                fr = candidates[0].get("finishReason")
+                if fr and fr != "FINISH_REASON_UNSPECIFIED":
+                    _finish_map = {
+                        "STOP": "tool_calls" if saw_tool_call else "stop",
+                        "MAX_TOKENS": "length",
+                        "SAFETY": "content_filter",
+                        "RECITATION": "content_filter",
+                        "MALFORMED_FUNCTION_CALL": "stop",  # let caller retry; emit as stop
+                    }
+                    finish_reason = _finish_map.get(fr, "stop")
+
+            _dbg(f"stream done finish={finish_reason} text_len={len(acc_text)} tool_call={saw_tool_call} events={_ev_log}")
+
+            # Final chunk carries the finish_reason.
+            self.wfile.write(_build_openai_chunk(model, "", finish_reason=finish_reason).encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Client hung up mid-stream: abort quietly, drop the upstream too.
+            _dbg(f"client disconnected mid-stream after {len(acc_text)} chars")
+        except OSError as e:
+            # Upstream read failure (timeout / reset): end the SSE stream so
+            # the client can retry instead of hanging forever.
+            _dbg(f"upstream stream error: {e!r}")
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                pass
+        finally:
+            conn.close()
+            self.close_connection = True
+
+    def _forward(self, path, method, body=None):
+        conn = None
+        try:
+            conn, resp = _upstream_request(method, path, body=body)
+            raw = resp.read()
+            status = resp.status
+            ct = resp.getheader("Content-Type", "application/json")
+        except OSError as e:
+            self._send_json(502, {"error": str(e)})
+            return
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        self.send_response(status)
+        if ct:
+            self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def log_message(self, format, *args):
         pass  # suppress default access log
 
 
+class BridgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError)):
+            return  # routine client disconnects, not worth a traceback
+        sys.stderr.write(f"[BRIDGE] error handling {client_address}: {exc!r}\n")
+
+
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 3404
-    server = HTTPServer(("127.0.0.1", port), BridgeHandler)
-    print(f"Bridge running on :{port} → proxy on {PROXY_URL} (v3.1, tools+stream)", flush=True)
+    server = BridgeServer(("127.0.0.1", port), BridgeHandler)
+    print(f"Bridge running on :{port} → proxy on {PROXY_URL} "
+          f"(v4, threaded, tools+stream, debug={'on' if DEBUG else 'off'})", flush=True)
     server.serve_forever()
 
 
