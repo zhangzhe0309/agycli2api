@@ -27,6 +27,16 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 PROXY_URL = "http://127.0.0.1:3403"
 API_KEY = "hermes-agy-proxy-2026"
 
+# Map short model names to full model names supported by agycli2api/Antigravity.
+_MODEL_MAP = {
+    "gemini-3.7-flash": "gemini-3.7-flash-medium",
+    "gemini-3.6-flash": "gemini-3.6-flash-medium",
+}
+
+def _resolve_model(name: str) -> str:
+    """Resolve a model name to the full name supported by agycli2api."""
+    return _MODEL_MAP.get(name, name)
+
 # JSON-schema keys Gemini's functionDeclarations accepts.
 _SCHEMA_KEYS = ("type", "properties", "required", "items", "enum", "description",
                 "format", "anyOf", "allOf", "minimum", "maximum", "default")
@@ -310,7 +320,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._forward(PROXY_URL + self.path, "POST", body)
             return
 
-        if parsed_path == "/chat/completions":
+        if parsed_path in ("/chat/completions", "/v1/chat/completions"):
             data = json.loads(body) if body else {}
             model = data.get("model", "gemini-3.6-flash-medium")
             is_stream = data.get("stream", False)
@@ -344,7 +354,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _handle_non_streaming(self, model, req_data):
         """Non-streaming: call :generateContent, return full OpenAI JSON."""
-        target = f"{PROXY_URL}/v1beta/models/{model}:generateContent?key={API_KEY}"
+        resolved = _resolve_model(model)
+        target = f"{PROXY_URL}/v1beta/models/{resolved}:generateContent?key={API_KEY}"
         proc = subprocess.run(
             ["curl", "-s", "-X", "POST", target,
              "-H", "Content-Type: application/json",
@@ -412,7 +423,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _handle_streaming(self, model, req_data):
         """Streaming: call :streamGenerateContent, translate SSE events."""
-        target = f"{PROXY_URL}/v1beta/models/{model}:streamGenerateContent?key={API_KEY}&alt=sse"
+        resolved = _resolve_model(model)
+        target = f"{PROXY_URL}/v1beta/models/{resolved}:streamGenerateContent?key={API_KEY}&alt=sse"
         proc = subprocess.Popen(
             ["curl", "-s", "-N", "-X", "POST", target,
              "-H", "Content-Type: application/json",

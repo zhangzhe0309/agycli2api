@@ -1,7 +1,7 @@
 import os from "node:os";
 
 function generateSmartUserAgent() {
-	const version = process.env.ANTIGRAVITY_VERSION || "1.0.6";
+	const version = process.env.ANTIGRAVITY_VERSION || "1.1.12";
 	const osPlatform = os.platform();
 	const architecture = os.arch();
 	const osName =
