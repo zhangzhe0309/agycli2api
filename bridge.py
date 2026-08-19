@@ -31,11 +31,25 @@ API_KEY = "hermes-agy-proxy-2026"
 _MODEL_MAP = {
     "gemini-3.7-flash": "gemini-3.7-flash-medium",
     "gemini-3.6-flash": "gemini-3.6-flash-medium",
+    "gemini-2.5-flash": "gemini-2.5-flash",
+    "gemini-2.5-pro": "gemini-2.5-pro",
 }
 
-def _resolve_model(name: str) -> str:
-    """Resolve a model name to the full name supported by agycli2api."""
-    return _MODEL_MAP.get(name, name)
+def _resolve_model(name: str, reasoning_effort: str = None) -> str:
+    """Resolve a model name + optional reasoning_effort to Antigravity model name."""
+    if not name:
+        return "gemini-3.7-flash-medium"
+    if "/" in name:
+        name = name.split("/")[-1]
+    if name.endswith(("-low", "-medium", "-high", "-off")):
+        return name
+    effort = (reasoning_effort or "").strip().lower()
+    if effort in ("low", "medium", "high"):
+        if "3.7-flash" in name:
+            return f"gemini-3.7-flash-{effort}"
+        if "3.6-flash" in name:
+            return f"gemini-3.6-flash-{effort}"
+    return _MODEL_MAP.get(name, f"{name}-medium" if "flash" in name and ("3.7" in name or "3.6" in name) else name)
 
 # JSON-schema keys Gemini's functionDeclarations accepts.
 _SCHEMA_KEYS = ("type", "properties", "required", "items", "enum", "description",
@@ -344,17 +358,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
             gemini_body = _build_gemini_body(data)
             req_data = json.dumps(gemini_body).encode()
+            effort = data.get("reasoning_effort")
 
             if is_stream:
-                self._handle_streaming(model, req_data)
+                self._handle_streaming(model, req_data, effort=effort)
             else:
-                self._handle_non_streaming(model, req_data)
+                self._handle_non_streaming(model, req_data, effort=effort)
         else:
             self._forward(PROXY_URL + self.path, "POST", body)
 
-    def _handle_non_streaming(self, model, req_data):
+    def _handle_non_streaming(self, model, req_data, effort=None):
         """Non-streaming: call :generateContent, return full OpenAI JSON."""
-        resolved = _resolve_model(model)
+        resolved = _resolve_model(model, effort)
         target = f"{PROXY_URL}/v1beta/models/{resolved}:generateContent?key={API_KEY}"
         proc = subprocess.run(
             ["curl", "-s", "-X", "POST", target,
@@ -421,9 +436,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(proc.stdout)
 
-    def _handle_streaming(self, model, req_data):
+    def _handle_streaming(self, model, req_data, effort=None):
         """Streaming: call :streamGenerateContent, translate SSE events."""
-        resolved = _resolve_model(model)
+        resolved = _resolve_model(model, effort)
         target = f"{PROXY_URL}/v1beta/models/{resolved}:streamGenerateContent?key={API_KEY}&alt=sse"
         proc = subprocess.Popen(
             ["curl", "-s", "-N", "-X", "POST", target,

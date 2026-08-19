@@ -205,6 +205,48 @@ function formatRequestError(error: unknown): string {
 	return details.join(" ");
 }
 
+async function fetchWithRetry(
+	url: string,
+	init: RequestInit,
+	maxRetries = 2,
+	delayMs = 600,
+): Promise<globalThis.Response> {
+	let lastErr: unknown;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			if (attempt > 0) {
+				console.log(`[agycli2api] Retry attempt ${attempt}/${maxRetries} for ${url}`);
+				await new Promise((r) => setTimeout(r, delayMs * Math.pow(1.5, attempt - 1)));
+			}
+			const response = await fetch(url, init);
+			if (attempt < maxRetries && [502, 503, 504].includes(response.status)) {
+				console.warn(`[agycli2api] Upstream HTTP ${response.status}, retrying...`);
+				continue;
+			}
+			return response;
+		} catch (err: any) {
+			lastErr = err;
+			const isRetryable =
+				err?.name === "TimeoutError" ||
+				err?.code === "UND_ERR_HEADERS_TIMEOUT" ||
+				err?.code === "UND_ERR_BODY_TIMEOUT" ||
+				err?.code === "UND_ERR_CONNECT_TIMEOUT" ||
+				err?.code === "ECONNRESET" ||
+				err?.code === "ETIMEDOUT" ||
+				err?.cause?.code === "UND_ERR_HEADERS_TIMEOUT" ||
+				err?.cause?.code === "ECONNRESET" ||
+				err?.message?.includes("fetch failed");
+
+			if (attempt < maxRetries && isRetryable) {
+				console.warn(`[agycli2api] Transient fetch error (${formatRequestError(err)}), retrying...`);
+				continue;
+			}
+			throw err;
+		}
+	}
+	throw lastErr;
+}
+
 export async function fetchProject(token: string | null) {
 	if (!token) throw new Error("Token is required to fetch project.");
 	if (cachedProject && cachedProject.token === token)
@@ -213,7 +255,7 @@ export async function fetchProject(token: string | null) {
 	const endpoint = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:loadCodeAssist`;
 	let failureReason: string | null = null;
 	try {
-		const response = await fetch(endpoint, {
+		const response = await fetchWithRetry(endpoint, {
 			method: "POST",
 			headers: {
 				...ANTIGRAVITY_HEADERS,
@@ -273,7 +315,7 @@ export async function fetchModels(token: string, project: string) {
 	}
 	const endpoint = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:fetchAvailableModels`;
 	try {
-		const response = await fetch(endpoint, {
+		const response = await fetchWithRetry(endpoint, {
 			method: "POST",
 			headers: {
 				...ANTIGRAVITY_HEADERS,
@@ -739,7 +781,7 @@ export async function handleGenerateContent(
 			? `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:streamGenerateContent?alt=sse`
 			: `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:generateContent`;
 
-		const response = await fetch(endpoint, {
+		const response = await fetchWithRetry(endpoint, {
 			method: "POST",
 			headers,
 			body: JSON.stringify(payload),
