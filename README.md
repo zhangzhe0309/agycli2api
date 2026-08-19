@@ -1,6 +1,6 @@
 # agycli2api
 
-`agycli2api` 是一个轻量级的单用户 API 代理服务，将请求代理至 Google Cloud Code (`daily-cloudcode-pa.googleapis.com`) 基础设施。它不仅暴露标准的 **Gemini API** 接口，还完美兼容 **OpenAI `/chat/completions`** 接口标准。
+`agycli2api` 是一个轻量级的单用户 API 代理服务，将请求代理至 Google Cloud Code (`daily-cloudcode-pa.googleapis.com`) 基础设施。它暴露标准的 **Gemini API** 接口；OpenAI `/chat/completions` 格式由随附的 Python 桥接模块（`bridge.py`，端口 `3404`）完整支持。
 
 ---
 
@@ -8,8 +8,8 @@
 
 - **双接口兼容**：
   - **Gemini 原生接口**：支持 `GET /v1beta/models` 查询模型列表及 `POST /v1beta/models/:model:generateContent` 生成内容。
-  - **OpenAI 兼容接口**：原生提供 `POST /chat/completions` 路由，方便支持 OpenAI 格式的客户端（如 Hermes、LangChain、Claude Code 等）无缝接入。
-- **完整 Tool / Function Calling 支持**：自动完成 OpenAI Tools 格式与 Gemini `functionDeclarations` 之间的双向映射。
+  - **OpenAI 兼容接口**：由 `bridge.py`（端口 `3404`）提供 `POST /chat/completions` 路由，方便支持 OpenAI 格式的客户端（如 Hermes、LangChain、Claude Code 等）无缝接入，完整支持流式、Tool Calling、模型名映射与 `reasoning_effort`。
+- **完整 Tool / Function Calling 支持**：`bridge.py` 自动完成 OpenAI Tools 格式与 Gemini `functionDeclarations` 之间的双向映射。
 - **流式传输 (SSE)**：全量支持 Server-Sent Events (SSE) 流式响应 Pass-through。
 - **思维链 (Thinking Budget) 优化**：自动调优 `maxOutputTokens`，避免由于思考过程消耗 Token 导致输出截断。
 - **防封与遥测伪装**：自动重写 `User-Agent`、客户端版本号与 Headers，完全一致化匹配官方 [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli)。
@@ -116,8 +116,10 @@ curl -X POST http://localhost:3403/v1beta/models/gemini-3-flash:generateContent 
 
 ### 3. OpenAI 格式 `/chat/completions` 请求示例
 
+OpenAI 格式由 `bridge.py` 桥接层提供（默认端口 `3404`，需先启动 `python3 bridge.py`）：
+
 ```bash
-curl -X POST http://localhost:3403/chat/completions \
+curl -X POST http://localhost:3404/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{

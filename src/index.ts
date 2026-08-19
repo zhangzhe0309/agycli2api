@@ -1,11 +1,7 @@
 import crypto from "node:crypto";
 import cors from "cors";
 import express from "express";
-import type { Request, Response } from "express";
-import { getToken } from "./auth.js";
-import { ANTIGRAVITY_ENDPOINT_DAILY, ANTIGRAVITY_HEADERS } from "./config.js";
-import { handleGenerateContent, handleListModels, fetchProject, fetchModels, buildPayload, type ModelConfig } from "./proxy.js";
-import os from "os";
+import { handleGenerateContent, handleListModels } from "./proxy.js";
 
 const app = express();
 app.use(cors());
@@ -47,99 +43,9 @@ app.post("/v1beta/models/:modelAndAction", (req, res) => {
 	return handleGenerateContent(req, res, isStreaming, model || "");
 });
 
-// --- OpenAI-compatible /chat/completions route ---
-// Hermes gemini provider sends OpenAI format when is_native_gemini_base_url() is false.
-// This middleware translates OpenAI messages[] → Gemini contents[] and forwards to the native endpoint.
-app.post("/chat/completions", async (req: Request, res: Response) => {
-  try {
-    const body = req.body;
-    const messages = body.messages || [];
-    const model = body.model || "gemini-3.6-flash-medium";
-    const maxTokens = body.max_tokens || body.max_output_tokens || 1024;
-    const temperature = body.temperature;
-
-    // Build Gemini contents[] from OpenAI messages[]
-    const contents: any[] = [];
-    let systemInstruction: any = null;
-
-    for (const msg of messages) {
-      if (msg.role === "system") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : (msg.content as any[]).map((p: any) => p.text || "").join("");
-        systemInstruction = { role: "user", parts: [{ text: `System: ${text}` }] };
-        continue;
-      }
-      const geminiRole = msg.role === "assistant" ? "model" : "user";
-      const text = typeof msg.content === "string"
-        ? msg.content
-        : (msg.content as any[]).map((p: any) => p.text || "").join("");
-      contents.push({ role: geminiRole, parts: [{ text }] });
-    }
-
-    const generationConfig: any = {};
-    if (maxTokens) generationConfig.maxOutputTokens = maxTokens;
-    if (temperature !== undefined) generationConfig.temperature = temperature;
-
-    const geminiBody: any = { contents };
-    if (systemInstruction) geminiBody.systemInstruction = systemInstruction;
-    if (Object.keys(generationConfig).length) geminiBody.generationConfig = generationConfig;
-
-    // Forward to native Gemini endpoint
-    const endpoint = `${ANTIGRAVITY_ENDPOINT_DAILY}/v1internal:generateContent`;
-    const token = await getToken();
-    const projectName = await fetchProject(token);
-    const availableModels = await fetchModels(token, projectName);
-    const modelConfig = availableModels[model] as ModelConfig | undefined;
-    const modelEnum = modelConfig?.model || "MODEL_PLACEHOLDER_M187";
-
-    const sessionKey = crypto.randomUUID();
-    const session = {
-      conversationId: crypto.randomUUID(),
-      trajectoryId: crypto.randomUUID(),
-      stepIndex: 3,
-      sessionId: sessionKey,
-      lastActive: Date.now(),
-      historyHashes: new Set<string>(),
-      lastUserMsgCnt: contents.filter(m => m.role === "user").length,
-      lastExecutionId: null,
-    };
-
-    const payload = buildPayload(
-      geminiBody, session, projectName, model, modelEnum,
-      generationConfig, systemInstruction,
-      session.conversationId,
-    );
-
-    const headers: Record<string, string> = {
-      ...ANTIGRAVITY_HEADERS,
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    };
-
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error(`Upstream error: ${response.status} - ${errText}`);
-      return res.status(response.status).send(errText);
-    }
-
-    const data = await response.json();
-    if (data?.response) {
-      res.json(data.response);
-    } else {
-      res.json(data);
-    }
-  } catch (err) {
-    console.error("Error in /chat/completions bridge:", err);
-    res.status(500).json({ error: { message: (err as Error).message } });
-  }
-});
+// OpenAI-format /chat/completions is intentionally NOT served here.
+// The full translation (stream, tools, model-name mapping, reasoning_effort)
+// lives in bridge.py on port 3404 — point OpenAI clients there instead.
 
 const PORT = process.env.PORT || 3403;
 app.listen(PORT, () => {

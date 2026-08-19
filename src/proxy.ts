@@ -344,7 +344,17 @@ export async function fetchModels(token: string, project: string) {
 			`Error fetching models from ${endpoint}: ${formatRequestError(err)}`,
 		);
 	}
-	return cachedModels?.models || {};
+	// On failure, only fall back to the cache when it belongs to the SAME
+	// token + project — otherwise we would hand out another credential's
+	// model list (stale token after refresh, wrong project, etc.).
+	if (
+		cachedModels &&
+		cachedModels.token === token &&
+		cachedModels.project === project
+	) {
+		return cachedModels.models;
+	}
+	return {};
 }
 
 interface GeminiModel {
