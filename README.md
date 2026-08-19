@@ -155,6 +155,34 @@ curl -X POST http://localhost:3403/chat/completions \
 
 ---
 
+## 🔑 OAuth Token 维护与失效重新登录指南
+
+代理服务自动读取并自动刷新 `~/.gemini/antigravity-cli/antigravity-oauth-token` 凭据。日常使用无需人工干预。
+
+若遇 Google 密码变更或主动撤销授权导致 Token 彻底失效，可通过以下两种方式重登：
+
+### 方式 1：VPS 本地一键设备码授权（推荐）
+
+在 VPS 终端执行自带的授权脚本：
+```bash
+python3 /opt/agycli2api/scripts/relogin.py
+```
+- 脚本会生成形如 `https://www.google.com/device` 的授权网址及 8 位验证码。
+- 在浏览器打开并确认授权后，脚本会自动生成合规的 `antigravity-oauth-token` 凭证并写入对应路径。
+- 重启服务生效：`systemctl restart agycli2api.service`
+
+### 方式 2：本地电脑复制
+
+在支持指令集的本地 Windows / Mac 电脑上运行官方 CLI 登录：
+```bash
+agy auth login
+```
+将本地生成的凭据文件复制覆盖到 VPS 的 `~/.gemini/antigravity-cli/antigravity-oauth-token`：
+- **Windows 本地路径**：`%USERPROFILE%\.gemini\antigravity-cli\antigravity-oauth-token`
+- **Mac/Linux 本地路径**：`~/.gemini/antigravity-cli/antigravity-oauth-token`
+
+---
+
 ## 📄 开源协议
 
 基于 [MIT License](LICENSE) 开源。
