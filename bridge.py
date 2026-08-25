@@ -419,6 +419,13 @@ def _dbg(msg):
 
 class BridgeHandler(BaseHTTPRequestHandler):
 
+    @staticmethod
+    def _add_key(path):
+        if "key=" in path or path.split("?")[0].rstrip("/") in ("/v1/models", "/models"):
+            return path
+        sep = "&" if "?" in path else "?"
+        return f"{path}{sep}key={API_KEY}"
+
     def _send_json(self, status, payload):
         """Send a JSON (or raw passthrough) response with Content-Length."""
         raw = payload if isinstance(payload, (bytes, bytearray)) else \
@@ -435,7 +442,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                 ConnectionAbortedError))
 
     def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") in ("/v1/models", "/models"):
+            self._list_models_openai()
+            return
         self._forward(self.path, "GET")
+
+    def _list_models_openai(self):
+        """Translate native /v1beta/models into OpenAI GET /v1/models."""
+        try:
+            conn, resp = _upstream_request("GET", f"/v1beta/models?key={API_KEY}")
+            raw = json.loads(resp.read())
+        except (OSError, ValueError) as e:
+            self._send_json(502, {"error": str(e)})
+            return
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+        models = [
+            {"id": m.get("name", "").removeprefix("models/"), "object": "model",
+             "owned_by": "agycli2api"}
+            for m in raw.get("models", [])
+        ]
+        self._send_json(200, {"object": "list", "data": models})
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -666,6 +697,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _forward(self, path, method, body=None):
         conn = None
         try:
+            path = self._add_key(path)
             conn, resp = _upstream_request(method, path, body=body)
             raw = resp.read()
             status = resp.status
