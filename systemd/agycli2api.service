@@ -1,0 +1,19 @@
+[Unit]
+Description=Antigravity CLI2API Proxy (Gemini API via agy OAuth)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agycli2api
+Environment=PORT=3403
+Environment=AGYCLI2API_KEY=hermes-agy-proxy-2026
+Environment=NODE_OPTIONS=--max-old-space-size=64
+Environment=HOME=/root
+ExecStart=/usr/bin/node --use-env-proxy --use-system-ca dist/index.js
+Restart=always
+RestartSec=5
+MemoryMax=96M
+
+[Install]
+WantedBy=multi-user.target

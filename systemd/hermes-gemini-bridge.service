@@ -1,0 +1,16 @@
+[Unit]
+Description=Gemini OpenAI↔Native Bridge (3403→3404)
+After=agycli2api.service
+Requires=agycli2api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agycli2api
+ExecStart=/usr/bin/python3 bridge.py 3404
+Restart=always
+RestartSec=3
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
