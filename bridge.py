@@ -92,6 +92,63 @@ def _upstream_request(method, path, body=None, timeout=UPSTREAM_TIMEOUT):
         raise
 
 
+# v4.1: Google's daily-cloudcode-pa frontends intermittently reject datacenter
+# IPs with "User location is not supported" (FAILED_PRECONDITION 400). Retrying
+# after a short backoff lands on a different frontend and usually succeeds.
+_LOCATION_RETRY_MAX = int(os.environ.get("BRIDGE_LOCATION_RETRY_MAX", "4"))
+_LOCATION_BACKOFFS = [2.0, 5.0, 9.0, 15.0]  # seconds, cumulative ~31s worst case
+
+
+def _is_location_block(resp) -> bool:
+    """Peek at an error response without destroying the stream: True when the
+    upstream 'User location is not supported' soft-block fired."""
+    if resp.status != 400:
+        return False
+    try:
+        raw = resp.read(4096)
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return False
+    msg = ""
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message", "")) + str(err.get("status", ""))
+        else:
+            msg = str(err or "")
+    return "location is not supported" in msg
+
+
+def _upstream_request_with_location_retry(method, path, body=None,
+                                          timeout=UPSTREAM_TIMEOUT):
+    """Like _upstream_request but transparently retries location soft-blocks.
+
+    Returns (conn, response) of the last attempt; all blocked attempts are
+    closed. Raises OSError subclasses on connection/socket failures.
+    """
+    last_conn = None
+    last_resp = None
+    for attempt in range(_LOCATION_RETRY_MAX + 1):
+        conn, resp = _upstream_request(method, path, body=body, timeout=timeout)
+        if attempt == _LOCATION_RETRY_MAX or not _is_location_block(resp):
+            return conn, resp
+        # Soft-blocked: close and back off before hitting another frontend.
+        try:
+            resp.read()
+        except OSError:
+            pass
+        conn.close()
+        delay = _LOCATION_BACKOFFS[min(attempt, len(_LOCATION_BACKOFFS) - 1)]
+        print(f"[bridge] location soft-block (attempt {attempt + 1}/"
+              f"{_LOCATION_RETRY_MAX}), retrying in {delay:.0f}s",
+              flush=True)
+        time.sleep(delay)
+    return last_conn, last_resp  # unreachable, keeps linters quiet
+
+
 def _extract_text(candidates):
     """Extract non-thought text from Gemini candidates."""
     texts = []
@@ -432,7 +489,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         resolved = _resolve_model(model, effort)
         path = f"/v1beta/models/{resolved}:generateContent?key={API_KEY}"
         try:
-            conn, resp = _upstream_request("POST", path, body=req_data)
+            conn, resp = _upstream_request_with_location_retry("POST", path, body=req_data)
         except OSError as e:
             self._send_json(502, {"error": f"upstream connection failed: {e}"})
             return
@@ -506,7 +563,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         resolved = _resolve_model(model, effort)
         path = f"/v1beta/models/{resolved}:streamGenerateContent?key={API_KEY}&alt=sse"
         try:
-            conn, resp = _upstream_request("POST", path, body=req_data)
+            conn, resp = _upstream_request_with_location_retry("POST", path, body=req_data)
         except OSError as e:
             self._send_json(502, {"error": f"upstream connection failed: {e}"})
             return

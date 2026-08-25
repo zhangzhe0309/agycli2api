@@ -2,62 +2,165 @@
 
 ## 1. 架构总览
 
-系统采用纯本地闭环代理架构，结合 Google Antigravity OAuth 与多线程协议转换桥，���时支持单机部署与跨 VPS 共享（104 主机 -> 192 主机持久反向隧道）：
+系统采用纯本地闭环代理架构，结合 Google Antigravity OAuth、Cloudflare Workers 全球边缘网关与多线程协议转换桥，同时支持单机部署与跨 VPS 隔离：
 
 ```
-[ 104 本机 Hermes Agent ] ──┐
-                            │ (OpenAI 协议: /v1/chat/completions)
-[ 192 远端 Hermes Agent ] ──┼──> [ gemini-tunnel-to-192.service (SSH 反向隧道) ]
-                            │
-                            ▼
-           [ hermes-gemini-bridge.service (端口: 3404) ]
-                            │ (Gemini 原生协议 / SSE 流式 / Tool Calling 映射)
-                            ▼
-           [ agycli2api.service (端口: 3403) ]
-                            │ (Google Antigravity OAuth Token / Google AI Pro 额度)
-                            ▼
-           [ Google Cloud Code / Gemini API 核心网关 ]
+[ Hermes Agent (OpenAI 格式) ]
+               │ (POST http://localhost:3404/v1/chat/completions)
+               ▼
+[ hermes-gemini-bridge.service (端口: 3404) ]
+               │ - OpenAI ↔ Gemini 原生协议转换
+               │ - 流式 SSE (Stream) 协议转换
+               │ - Tool / Function Calling 双向映射
+               │ - v4.1 内置 4 次退避重试 (2s/5s/9s/15s)
+               ▼
+[ agycli2api.service (端口: 3403) ]
+               │ - Google Antigravity OAuth Token 自动续期
+               │ - Google AI Pro (g1-pro-tier) 专属配额通道
+               │ - ANTIGRAVITY_ENDPOINT_DAILY 环境变量路由
+               ▼
+[ Cloudflare Workers 边缘代理 (gemini-cloudcode-proxy) ]
+               │ (https://gemini-cloudcode-proxy.zzhe0309.workers.dev)
+               │ - 全球 Anycast CDN 边缘出口，彻底规避机房 IP 地理与频率限制
+               ▼
+[ Google Cloud Code / Gemini API 核心网关 ]
+               (https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent)
 ```
 
 ---
 
-## 2. 核心组件与 Systemd 服务清单
+## 2. 账号分配与多 VPS 隔离规范
 
-### 2.1 agycli2api.service (端口: 3403)
-- **定位**：OAuth 鉴权与 Google 内网网关通信代理。
+- **104 VPS (本地主服)**：
+  - **绑定 Google 账号**：`zzhe0309@gmail.com` (Google AI Pro 订阅)
+  - **Token 路径**：`/root/.gemini/antigravity-cli/antigravity-oauth-token`
+  - **上游网关**：`https://gemini-cloudcode-proxy.zzhe0309.workers.dev`
+- **192 VPS (远端独立服)**：
+  - **绑定 Google 账号**：`qifan007@gmail.com` (Google AI Pro 订阅)
+  - **Token 路径**：`/root/.gemini/antigravity-cli/antigravity-oauth-token`
+  - **隔离铁律**：两台 VPS 各自独立运行本地代理与专属账号，凭据互为独立备份，严禁跨机混用覆盖。
+
+---
+
+## 3. Cloudflare Workers 边缘网关部署步骤
+
+为了彻底解决 VPS 数据中心 IP 访问 Google 偶发报 `User location is not supported for the API use.` (FAILED_PRECONDITION 400)，通过 Cloudflare Workers 构建轻量透明的反向代理。
+
+### 3.1 授权 Wrangler
+在 VPS 终端执行设备码授权：
+```bash
+npx --yes wrangler login --device
+```
+打开输出的验证 URL（`https://dash.cloudflare.com/oauth2/device/verify?user_code=xxxx`），登录 Cloudflare 账号并点击 **Allow** 授权。
+
+### 3.2 创建 Worker 项目
+```bash
+mkdir -p /root/cloudflare-gemini-worker/src
+cd /root/cloudflare-gemini-worker
+
+cat << 'EOF' > wrangler.json
+{
+  "name": "gemini-cloudcode-proxy",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-25"
+}
+EOF
+
+cat << 'EOF' > src/index.js
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const targetHost = "daily-cloudcode-pa.googleapis.com";
+    url.hostname = targetHost;
+    url.protocol = "https:";
+    url.port = "443";
+
+    const newHeaders = new Headers(request.headers);
+    newHeaders.set("Host", targetHost);
+
+    const init = {
+      method: request.method,
+      headers: newHeaders,
+      body: request.body,
+      redirect: "follow"
+    };
+
+    return fetch(url.toString(), init);
+  }
+};
+EOF
+```
+
+### 3.3 发布部署
+```bash
+npx wrangler deploy
+```
+部署完成后记录返回的域名（如 `https://gemini-cloudcode-proxy.zzhe0309.workers.dev`）。
+
+---
+
+## 4. 核心组件与 Systemd 服务配置
+
+### 4.1 agycli2api.service (端口: 3403)
 - **目录**：`/opt/agycli2api`
-- **入口命令**：`/usr/bin/node --use-env-proxy --use-system-ca dist/index.js`
-- **Token 路径**：`/root/.gemini/antigravity-cli/antigravity-oauth-token`
-- **特性**：
-  - 自动管理与刷新 OAuth Access Token（绑定 Google AI Pro `g1-pro-tier` 额度）。
-  - 内置内存上限保护（`MemoryMax=96M`）。
+- **代码特性**：`src/config.ts` 支持 `process.env.ANTIGRAVITY_ENDPOINT_DAILY`
+- **配置文件**：`/etc/systemd/system/agycli2api.service`
+```ini
+[Unit]
+Description=Antigravity CLI2API Proxy (Gemini API via agy OAuth)
+After=network.target
 
-### 2.2 hermes-gemini-bridge.service (端口: 3404)
-- **定位**：OpenAI ↔ Gemini 原生协议转换桥（Python ThreadingHTTPServer）。
-- **工作目录**：`/opt/agycli2api`
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agycli2api
+Environment=PORT=3403
+Environment=AGYCLI2API_KEY=hermes-agy-proxy-2026
+Environment=ANTIGRAVITY_ENDPOINT_DAILY=https://gemini-cloudcode-proxy.zzhe0309.workers.dev
+Environment=NODE_OPTIONS=--max-old-space-size=64
+Environment=HOME=/root
+ExecStart=/usr/bin/node --use-env-proxy --use-system-ca dist/index.js
+Restart=always
+RestartSec=5
+MemoryMax=96M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4.2 hermes-gemini-bridge.service (端口: 3404)
+- **目录**：`/opt/agycli2api`
 - **入口命令**：`/usr/bin/python3 bridge.py 3404`
 - **特性**：
   - 双向兼容 OpenAI `/v1/chat/completions` 与 `/chat/completions`。
-  - 支持 Tool/Function Calling 结构无损映射。
+  - 支持 Tool/Function Calling 结构映射。
   - 支持 SSE 流式传输（Streaming）与 Gemini 3.x Thought Signature。
-  - 支持请求鉴权（校验 Bearer Token: `hermes-agy-proxy-2026`）。
-  - 内置内存上限保护（`MemoryMax=64M`）。
+  - 内置 v4.1 指数退避重试（针对 400 Soft-block 自动切换上游前端重试）。
+- **配置文件**：`/etc/systemd/system/hermes-gemini-bridge.service`
+```ini
+[Unit]
+Description=Gemini OpenAI↔Native Bridge (3403→3404)
+After=agycli2api.service
+Requires=agycli2api.service
 
-### 2.3 gemini-tunnel-to-192.service (跨主机反向隧道)
-- **定位**：将 104 机本地 3404 端口安全穿透到 192.3.248.147 的 `127.0.0.1:3404`。
-- **入口命令**：`/usr/bin/ssh -N -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -R 3404:127.0.0.1:3404 root@192.3.248.147`
-- **效果**：192 机上的 Hermes Agent 无需重复配置 OAuth，可直接走本地 `http://localhost:3404` 共享 Pro 额度并避开机房 IP 限制。
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agycli2api
+ExecStart=/usr/bin/python3 bridge.py 3404
+Restart=always
+RestartSec=3
+MemoryMax=64M
 
-### 2.4 gemini-proxy.service (端口: 18080，辅助 MITM 代理)
-- **定位**：为移动端 VPN / sing-box 分流提供的 Gemini TLS 证书动态签发与反代服务。
-- **目录**：`/opt/gemini-proxy`
+[Install]
+WantedBy=multi-user.target
+```
 
 ---
 
-## 3. 配置文件规范
+## 5. Hermes 配置文件规范
 
-### 3.1 Hermes 配置文件 (`~/.hermes/config.yaml`)
-
+### 5.1 Hermes 配置文件 (`~/.hermes/config.yaml`)
 ```yaml
 model:
   default: gemini-3.7-flash
@@ -68,8 +171,23 @@ providers:
   gemini:
     base_url: http://localhost:3404
     key_env: GEMINI_API_KEY
+  zai:
+    base_url: https://open.bigmodel.cn/api/coding/paas/v4
+    key_env: ZAI_API_KEY
+  agnes2:
+    base_url: https://apihub.agnes-ai.com/v1
+    key_env: AGNES_API_KEY_2
+  sensenova:
+    base_url: https://token.sensenova.cn/v1
+    key_env: SENSENOVA_API_KEY
+  nvidia:
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
 
 fallback_providers:
+  - provider: zai
+    model: glm-5.2
+    base_url: https://open.bigmodel.cn/api/coding/paas/v4
   - provider: agnes2
     model: agnes-2.5-flash
     base_url: https://apihub.agnes-ai.com/v1
@@ -79,71 +197,45 @@ fallback_providers:
   - provider: nvidia
     model: deepseek-ai/deepseek-v4-flash-0731
     base_url: https://integrate.api.nvidia.com/v1
-  - provider: zai
-    model: glm-5.2
-    base_url: https://open.bigmodel.cn/api/paas/v4
 ```
 
-### 3.2 环境变量文件 (`~/.hermes/.env`)
-
+### 5.2 环境变量文件 (`~/.hermes/.env`)
 ```env
 GEMINI_API_KEY=hermes-agy-proxy-2026
+ZAI_API_KEY=b83ae4a99a7a4925a97058b7180cea89.g96vPfru8d7eqzbR
 ```
-
-> **注意**：`hermes-agy-proxy-2026` 为 3404 Bridge 内部通信安全 Token，防止未授权请求。
 
 ---
 
-## 4. 常用服务运维命令
+## 6. 运维与验证命令
 
-### 4.1 查看服务状态与日志
-```bash
-# 查看所有 Gemini 相关服务状态
-systemctl status agycli2api.service hermes-gemini-bridge.service gemini-tunnel-to-192.service --no-pager
-
-# 查看 Bridge 实时日志
-journalctl -u hermes-gemini-bridge.service -f -n 50
-
-# 查看 OAuth 代理日志（查看 Token 刷新情况）
-journalctl -u agycli2api.service -f -n 50
-```
-
-### 4.2 重启与重载
+### 6.1 服务重载与重启
 ```bash
 systemctl daemon-reload
-systemctl restart agycli2api.service hermes-gemini-bridge.service gemini-tunnel-to-192.service
+systemctl restart agycli2api.service hermes-gemini-bridge.service
 ```
 
----
-
-## 5. 连通性测试与验证流程
-
-### 5.1 基础接口测试 (Curl)
+### 6.2 连通性测试 (OpenAI 协议)
 ```bash
 curl -s http://127.0.0.1:3404/v1/chat/completions \
   -H "Authorization: Bearer hermes-agy-proxy-2026" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemini-3.7-flash",
-    "messages": [{"role": "user", "content": "ping"}]
+    "messages": [{"role": "user", "content": "ping"}],
+    "max_tokens": 10
   }'
 ```
 
-**预期返回**：包含 `"content": "..."` 的标准 OpenAI 响应 JSON。
-
-### 5.2 跨机 192 节点连通性测试
-在 192.3.248.147 主机上执行相同 curl 命令，验证 `127.0.0.1:3404` 穿透是否正常。
-
----
-
-## 6. 常见问题排查 (Troubleshooting)
-
-1. **报错 `Unauthorized: Invalid API Key`**
-   - 检查请求头是否携带 `Authorization: Bearer hermes-agy-proxy-2026`。
-   - 检查 `~/.hermes/.env` 中 `GEMINI_API_KEY` 是否正确配置。
-
-2. **Token 过期或报 401/403**
-   - `agycli2api` 内置每小时自动刷新机制。如果手动调试，可检查 `/root/.gemini/antigravity-cli/antigravity-oauth-token` 文件修改时间或重启 `agycli2api.service`。
-
-3. **192 主机无法连接 3404 端口**
-   - 在 104 机上检查 `systemctl status gemini-tunnel-to-192.service`，确保 SSH 反向隧道进程正常存活。
+### 6.3 流式响应测试 (SSE)
+```bash
+curl -N http://127.0.0.1:3404/v1/chat/completions \
+  -H "Authorization: Bearer hermes-agy-proxy-2026" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.7-flash",
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": true,
+    "max_tokens": 15
+  }'
+```
